@@ -1,0 +1,82 @@
+# ============================================================
+# Medical Knowledge Assistant — .gitignore
+# ============================================================
+
+# ----- Secrets & environment -----
+.env
+*.env
+.env.local
+.env.production
+
+# ----- Virtual environment -----
+venv/
+.venv/
+env/
+ENV/
+
+# ----- Python cache -----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ----- pytest / coverage -----
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.cover
+
+# ----- Distribution / packaging -----
+dist/
+build/
+*.egg-info/
+*.egg
+wheels/
+
+# ----- Jupyter notebooks -----
+.ipynb_checkpoints/
+*.ipynb
+
+# ----- IDEs -----
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ----- OS files -----
+.DS_Store
+Thumbs.db
+desktop.ini
+conftest.py
+pytest.ini
+docker-compose.yml
+
+# ----- Docker volumes (if mounted locally) -----
+neo4j_data/
+neo4j_logs/
+qdrant_storage/
+
+# ----- Model files (large, download separately) -----
+*.bin
+*.pt
+*.safetensors
+models/
+weights/
+
+# ----- Generated output files -----
+graph_visualization.html
+*.html
+
+# ----- Logs -----
+*.log
+logs/
+
+# ----- Temporary files -----
+*.tmp
+*.bak
+*.swp
