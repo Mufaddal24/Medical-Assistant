@@ -20,6 +20,8 @@ needed. Built on Neo4j, Qdrant, BioBERT, LangGraph, and GPT-4o.
    - [Module 2 — NLPProcessor](#module-2--nlpprocessor-srcnlpprocessorpy)
    - [Module 3 — GraphBuilder](#module-3--graphbuilder-srcgraphbuilderpy)
    - [Module 4 — VectorIndexer](#module-4--vectorindexer-srcvectorindexerpy)
+   - [Module 5 — RetrievalOrchestrator](#module-5--retrievalorchestrator-srcretrievalorchestratorp)
+   - [Module 6 — PromptBuilder](#module-6--promptbuilder-srcgenerationprompt_builderpy)
 6. [Modules Pending](#6-modules-pending)
 7. [Data Flow Walkthrough](#7-data-flow-walkthrough)
 8. [Graph Schema](#8-graph-schema)
@@ -191,9 +193,9 @@ src/
 ├── vector/
 │   └── indexer.py             ← Module 4: VectorIndexer
 ├── retrieval/
-│   └── orchestrator.py        ← Module 5: RetrievalOrchestrator [pending]
+│   └── orchestrator.py        ← Module 5: RetrievalOrchestrator
 ├── generation/
-│   ├── prompt_builder.py      ← Module 6: PromptBuilder         [pending]
+│   ├── prompt_builder.py      ← Module 6: PromptBuilder
 │   └── llm_interface.py       ← Module 7: LLMInterface          [pending]
 ├── api/
 │   └── app.py                 ← Module 9: FastAPI app           [pending]
@@ -249,17 +251,26 @@ creating duplicate points. Gracefully degrades to zero vectors when
 `transformers`/`torch` are not installed, and to dry-run mode when Qdrant
 is unreachable.
 
-#### `src/retrieval/orchestrator.py` — RetrievalOrchestrator *(pending)*
-LangGraph state machine with five nodes. The routing logic in
-`QueryClassifier` decides whether to hit the graph, the vector store,
-both, or also the web. The `HybridMerger` node is where Cohere Rerank
-runs to score and deduplicate results from all sources.
+#### `src/retrieval/orchestrator.py` — RetrievalOrchestrator
+LangGraph state machine with five nodes: `QueryClassifier`, `GraphRetriever`,
+`VectorRetriever`, `WebSearchNode`, and `HybridMerger`. The graph is compiled
+at init time and invoked per query. Each node returns a partial state update.
+Conditional edges route between graph-only, vector-only, hybrid, and web-first
+strategies. Falls back to sequential execution when LangGraph is unavailable.
+Cohere Rerank re-scores the merged result set; deduplication uses a normalised
+120-character text fingerprint. Returns a `RetrievalResult` containing the
+subgraph, vector chunks, web snippets, and merged final ranking.
 
-#### `src/generation/prompt_builder.py` — PromptBuilder *(pending)*
-Assembles the final prompt string. Always includes the medical safety
-disclaimer in the system message. Formats graph triples as structured
-context, vector chunks as supporting evidence, and web snippets with
-their publication dates.
+#### `src/generation/prompt_builder.py` — PromptBuilder
+Assembles the final LLM prompt from all retrieved context. Splits output
+into a `system` message (role definition + medical disclaimer) and a `user`
+message (graph triples, vector chunks, web snippets, JSON output schema, and
+the question). Exposes both `build()` (flat string) and `build_messages()`
+(OpenAI-style list) to support different LLM call patterns. Each section has
+an independent character budget; total prompt is hard-capped at ~44 000 chars
+(≈ 11 000 tokens) with the question always preserved at the tail even after
+trimming. Always displays relevance scores; handles `score=0.0` correctly
+(does not suppress falsy float scores).
 
 #### `src/generation/llm_interface.py` — LLMInterface *(pending)*
 Single-responsibility LLM call wrapper. Parses the structured JSON response
@@ -293,14 +304,19 @@ medical-kg-assistant/
 │   │   └── builder.py
 │   ├── vector/
 │   │   └── indexer.py
-│   ├── retrieval/            (pending)
-│   ├── generation/           (pending)
-│   ├── api/                  (pending)
-│   ├── ui/                   (pending)
+│   ├── retrieval/
+│   │   └── orchestrator.py
+│   ├── generation/
+│   │   ├── prompt_builder.py
+│   │   └── llm_interface.py       (pending)
+│   ├── api/                       (pending)
+│   ├── ui/                        (pending)
 │   └── tests/
 │       ├── test_data_nlp.py
 │       ├── test_graph_builder.py
-│       └── test_vector_indexer.py
+│       ├── test_vector_indexer.py
+│       ├── test_orchestrator.py
+│       └── test_prompt_builder.py
 ├── docker-compose.yml
 ├── requirements.txt
 ├── pytest.ini
@@ -1142,12 +1158,295 @@ Returns statistics about the Qdrant collection.
 | `_connect_qdrant()` | Establishes Qdrant connection with `check_compatibility=False` to avoid version mismatch errors |
 
 
+---
+
+### Module 5 — RetrievalOrchestrator (`src/retrieval/orchestrator.py`)
+
+#### Position in the pipeline
+```
+GraphBuilder ──┐
+               ├──► RetrievalOrchestrator ──► RetrievalResult ──► PromptBuilder
+VectorIndexer ─┘          │
+                     Tavily (web)
+                     Cohere (rerank)
+```
+The central query-time component. Receives a user query, decides the best
+retrieval strategy, fetches relevant context from all sources, and returns
+a ranked `RetrievalResult` ready for the PromptBuilder.
+
+#### LangGraph State Machine
+
+```
+                    ┌──(graph|hybrid)──► graph_retriever ──(hybrid)──► vector_retriever
+query_classifier ───┤                         │(graph only)                  │
+                    ├──(vector)───────────────────────────────────────► check web?
+                    │                                                        │
+                    └──(web)────────────────────────────────►  web_search ◄──┘
+                                                                  │
+                                                            hybrid_merger ──► END
+```
+
+**Internet search fires when ANY condition is true:**
+- **(a)** A matched graph node has `last_updated` older than `WEB_SEARCH_STALENESS_DAYS` (default 180)
+- **(b)** Query contains temporal keywords: `latest`, `recent`, `new`, `current`, `2024`, `2025`, `2026`
+- **(c)** Graph + vector retrieval together return fewer than 3 result chunks
+
+#### Class: `RetrievalOrchestrator`
+
+**Constructor**
+```python
+RetrievalOrchestrator(
+    graph_builder: Optional[GraphBuilder] = None,
+    vector_indexer: Optional[VectorIndexer] = None,
+    tavily_api_key: Optional[str] = None,    # loaded from TAVILY_API_KEY env var
+    cohere_api_key: Optional[str] = None,    # loaded from COHERE_API_KEY env var
+    force_web_search: bool = False           # always trigger web (for testing)
+)
+```
+
+**Graceful degradation:** Every dependency is optional. The orchestrator starts
+and runs even with no Neo4j, no Qdrant, no Tavily, and no Cohere. Missing
+components produce empty results and logged warnings rather than exceptions.
+
+---
+
+##### `run(query, mode) → RetrievalResult`
+
+Execute the full retrieval pipeline for a query.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | `str` | required | Natural-language medical question |
+| `mode` | `Optional[RetrievalMode]` | `None` | Force a retrieval mode; `None` = auto-route |
+
+**Returns:** `RetrievalResult` — structured result with all retrieved context
+
+**Example:**
+```python
+orch = RetrievalOrchestrator(graph_builder=gb, vector_indexer=vi)
+result = orch.run("What drugs treat Type 2 Diabetes?")
+# result.retrieval_mode == RetrievalMode.HYBRID
+# result.merged_chunks[0].score == 0.91
+# result.web_search_triggered == False
+```
+
+---
+
+#### Output Model: `RetrievalResult`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `query` | `str` | The original user query |
+| `retrieval_mode` | `RetrievalMode` | Mode used: graph, vector, hybrid, or web |
+| `graph_subgraph` | `Optional[GraphSubgraph]` | Multi-hop subgraph from Neo4j |
+| `vector_chunks` | `List[Chunk]` | Top-K BioBERT similarity results from Qdrant |
+| `web_snippets` | `List[WebSnippet]` | Tavily search results (empty if not triggered) |
+| `merged_chunks` | `List[Chunk]` | Final re-ranked and deduplicated result list |
+| `web_search_triggered` | `bool` | Whether internet search fired |
+| `errors` | `List[str]` | Non-fatal errors logged during retrieval |
+
+---
+
+#### Node: `_node_classify_query`
+
+Analyses the query to determine retrieval strategy.
+
+**Routing table:**
+
+| Condition | Mode set |
+|-----------|----------|
+| Temporal keywords present | `hybrid` (+ web flagged) |
+| Graph keywords (`relationship`, `path`, `connected`) | `graph` |
+| Default | `hybrid` |
+| Mode explicitly forced | Uses forced value |
+
+---
+
+#### Node: `_node_graph_retriever`
+
+Retrieves a multi-hop subgraph from Neo4j. Checks every returned node's
+`last_updated` — sets `should_web_search=True` if any node is older than
+`WEB_SEARCH_STALENESS_DAYS` (condition a).
+
+---
+
+#### Node: `_node_vector_retriever`
+
+Retrieves semantically similar chunks from Qdrant via BioBERT. Sets
+`should_web_search=True` if total results < 3 (condition c).
+
+---
+
+#### Node: `_node_web_search`
+
+Executes a Tavily live web search when triggered. Skips entirely when
+`should_web_search=False`. Truncates snippet content to 800 characters
+and tags every result with `source="web"`.
+
+---
+
+#### Node: `_node_hybrid_merger`
+
+Merges all sources into a single ranked list.
+
+1. Converts `graph_subgraph` nodes → `Chunk` objects (one per node + one per edge triple)
+2. Combines with `vector_chunks` and web-converted chunks
+3. Deduplicates using a 120-character normalised text fingerprint
+4. Re-ranks with Cohere Rerank API when available; falls back to score-descending sort
+5. Returns top `_MERGE_TOP_K` (10) chunks
+
+---
+
+#### Internal helpers
+
+| Helper | Description |
+|--------|-------------|
+| `_has_temporal_keywords(query)` | Checks for temporal words triggering condition (b) |
+| `_has_graph_keywords(query)` | Detects relationship-focused queries |
+| `_extract_cuis_from_query(query)` | Searches graph for entity names in the query (up to 5 CUIs) |
+| `_has_stale_node(subgraph)` | Returns True if any node `last_updated` > staleness threshold |
+| `_subgraph_to_chunks(subgraph)` | Converts Neo4j nodes and edges into Chunk objects for ranking |
+| `_deduplicate(chunks)` | Removes near-duplicate chunks by text fingerprint |
+| `_cohere_rerank(query, chunks, top_k)` | Calls Cohere Rerank API; falls back to score sort on error |
+| `_sequential_fallback(state)` | Runs all nodes in sequence when LangGraph is unavailable |
+
+---
+
+### Module 6 — PromptBuilder (`src/generation/prompt_builder.py`)
+
+#### Position in the pipeline
+```
+RetrievalResult ──► PromptBuilder ──► str / List[dict] ──► LLMInterface
+```
+Receives the `RetrievalResult` from the orchestrator (graph subgraph, vector
+chunks, web snippets, merged ranking) and assembles a structured prompt ready
+for GPT-4o. Has no external dependencies — pure Python string manipulation.
+
+#### Class: `PromptBuilder`
+
+**Constructor**
+```python
+PromptBuilder(
+    max_prompt_chars: int = 44_000  # hard ceiling ≈ 11 000 GPT-4o tokens
+)
+```
+
+---
+
+##### `build(query, graph_subgraph, vector_chunks, web_snippets, merged_chunks) → str`
+
+Assemble a flat prompt string for direct injection into an LLM call.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | `str` | required | Original natural-language question |
+| `graph_subgraph` | `Optional[GraphSubgraph]` | required | Neo4j subgraph (or `None`) |
+| `vector_chunks` | `List[Chunk]` | required | BioBERT similarity results |
+| `web_snippets` | `List[WebSnippet]` | required | Tavily live results (empty if not triggered) |
+| `merged_chunks` | `List[Chunk]` | required | Final re-ranked merged list |
+
+**Returns:** `str` — a single formatted prompt string
+
+**Prompt structure (7 labelled sections):**
+
+| Section | Header | Content |
+|---------|--------|---------|
+| 1 | `=== SYSTEM ===` | Role definition + medical safety disclaimer + output rules |
+| 2 | `=== KNOWLEDGE GRAPH CONTEXT ===` | Neo4j nodes with `[QUERY MATCH]` markers and edge triples |
+| 3 | `=== VECTOR SEARCH EVIDENCE ===` | BioBERT chunks indexed `[V1]`, `[V2]`, … with scores and source URLs |
+| 4 | `=== LIVE WEB SEARCH RESULTS ===` | Tavily snippets tagged `[WEB]` with `pub_date` indexed `[W1]`, `[W2]`, … |
+| 5 | `=== MERGED & RE-RANKED CONTEXT ===` | Cohere-ranked final list indexed `[M1]`, `[M2]`, … |
+| 6 | `=== REQUIRED JSON OUTPUT SCHEMA ===` | Exact JSON structure the LLM must return |
+| 7 | `=== QUESTION ===` | User query — always last, always preserved after trimming |
+
+Sections 2–5 are omitted when their source list is empty (no orphan headers).
+Each section has an independent character budget; total prompt is hard-capped
+at `max_prompt_chars` (default 44 000). If the limit is hit, sections are
+trimmed from the middle outward and the question is always re-attached at the
+end.
+
+**Example:**
+```python
+builder = PromptBuilder()
+prompt = builder.build(
+    query="What drugs treat Type 2 Diabetes?",
+    graph_subgraph=result.graph_subgraph,
+    vector_chunks=result.vector_chunks,
+    web_snippets=result.web_snippets,
+    merged_chunks=result.merged_chunks,
+)
+# prompt starts with "=== SYSTEM ===" and ends with "=== QUESTION ==="
+# len(prompt) <= 44_000
+```
+
+---
+
+##### `build_messages(query, graph_subgraph, vector_chunks, web_snippets, merged_chunks) → List[dict]`
+
+Return OpenAI-style `messages` list for GPT-4o chat completions.
+
+**Returns:** `[{"role": "system", "content": ...}, {"role": "user", "content": ...}]`
+
+The `system` message contains the role definition and medical disclaimer.
+The `user` message contains all context sections, the output schema, and the
+question. This is the recommended format when calling the OpenAI Chat API.
+
+**Example:**
+```python
+messages = builder.build_messages(query, subgraph, chunks, snippets, merged)
+response = openai_client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+)
+```
+
+---
+
+#### Section character budgets
+
+| Section | Budget |
+|---------|--------|
+| Graph context | 8 000 chars |
+| Vector evidence | 10 000 chars |
+| Web results | 6 000 chars |
+| Merged context | 10 000 chars |
+| Total hard cap | 44 000 chars |
+
+Each section trims its own content independently when over budget, appending
+`... [section trimmed]` so the LLM always knows context was cut.
+
+---
+
+#### Medical safety disclaimer
+
+The following disclaimer is always injected into the system message and cannot
+be suppressed:
+
+```
+⚠️  MEDICAL DISCLAIMER: This system is for educational and research purposes
+only. It does NOT constitute medical advice, diagnosis, or treatment. Always
+consult a qualified healthcare professional before making any medical
+decisions. Information may be incomplete or outdated.
+```
+
+---
+
+#### Internal helpers
+
+| Helper | Description |
+|--------|-------------|
+| `_build_system_block()` | Role definition + disclaimer + output rules |
+| `_build_graph_block(subgraph)` | Formats nodes with `[QUERY MATCH]` markers and edge triples |
+| `_build_vector_block(chunks)` | Formats BioBERT chunks as `[V1]…[Vn]` indexed passages |
+| `_build_web_block(snippets)` | Formats Tavily snippets as `[W1]…[Wn]` with `pub_date` and `[WEB]` tag |
+| `_build_merged_block(chunks)` | Formats re-ranked chunks as `[M1]…[Mn]` |
+| `_build_schema_block()` | Injects the JSON output schema the LLM must follow |
+| `_build_question_block(query)` | Wraps the user question in its section header |
+
 ## 6. Modules Pending
 
 | Module | File | Key Responsibility |
 |--------|------|--------------------|
-| 5 — RetrievalOrchestrator | `src/retrieval/orchestrator.py` | LangGraph state machine, hybrid retrieval |
-| 6 — PromptBuilder | `src/generation/prompt_builder.py` | Structured prompt assembly with disclaimer |
 | 7 — LLMInterface | `src/generation/llm_interface.py` | GPT-4o call, MedicalAnswer parsing |
 | 8 — GraphVisualizer | `src/graph/visualizer.py` | pyvis HTML graph output |
 | 9 — FastAPI App | `src/api/app.py` | REST API endpoints |
@@ -1191,7 +1490,7 @@ Returns statistics about the Qdrant collection.
 1. User: "What drugs treat Type 2 Diabetes?"
         │
         ▼
-2. RetrievalOrchestrator  [Module 5 — pending]
+2. RetrievalOrchestrator
         │
         ├── QueryClassifier  →  mode: "hybrid"
         ├── GraphRetriever   →  Cypher: MATCH path from "Type 2 Diabetes" hops=2
@@ -1342,6 +1641,8 @@ python -m pytest src/tests/ -v
 python -m pytest src/tests/test_data_nlp.py -v
 python -m pytest src/tests/test_graph_builder.py -v
 python -m pytest src/tests/test_vector_indexer.py -v
+python -m pytest src/tests/test_orchestrator.py -v
+python -m pytest src/tests/test_prompt_builder.py -v
 ```
 
 ### Test inventory
@@ -1351,6 +1652,8 @@ python -m pytest src/tests/test_vector_indexer.py -v
 | `test_data_nlp.py` | 25 unit + 3 integration | DataFetcher (all 4 sources), NLPProcessor (entities, relations, UMLS linking) |
 | `test_graph_builder.py` | 24 unit + 1 integration | GraphBuilder (connection, node/edge CRUD, batch upsert, subgraph retrieval, confidence calculation) |
 | `test_vector_indexer.py` | 38 unit + 1 integration | VectorIndexer (chunking, embedding, collection management, upsert, similarity search, deletion, stats) |
+| `test_orchestrator.py` | 47 unit + 1 integration | RetrievalOrchestrator (classifier, graph/vector/web nodes, merger, routing, staleness, end-to-end run) |
+| `test_prompt_builder.py` | 52 unit | PromptBuilder (all 7 sections, build/build_messages, trimming, zero-score display, edge cases) |
 
 ---
 
