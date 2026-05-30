@@ -22,6 +22,7 @@ needed. Built on Neo4j, Qdrant, BioBERT, LangGraph, and GPT-4o.
    - [Module 4 — VectorIndexer](#module-4--vectorindexer-srcvectorindexerpy)
    - [Module 5 — RetrievalOrchestrator](#module-5--retrievalorchestrator-srcretrievalorchestratorp)
    - [Module 6 — PromptBuilder](#module-6--promptbuilder-srcgenerationprompt_builderpy)
+   - [Module 7 — LLMInterface](#module-7--llminterface-srcgenerationllm_interfacepy)
 6. [Modules Pending](#6-modules-pending)
 7. [Data Flow Walkthrough](#7-data-flow-walkthrough)
 8. [Graph Schema](#8-graph-schema)
@@ -196,7 +197,7 @@ src/
 │   └── orchestrator.py        ← Module 5: RetrievalOrchestrator
 ├── generation/
 │   ├── prompt_builder.py      ← Module 6: PromptBuilder
-│   └── llm_interface.py       ← Module 7: LLMInterface          [pending]
+│   └── llm_interface.py       ← Module 7: LLMInterface
 ├── api/
 │   └── app.py                 ← Module 9: FastAPI app           [pending]
 ├── ui/
@@ -272,10 +273,18 @@ an independent character budget; total prompt is hard-capped at ~44 000 chars
 trimming. Always displays relevance scores; handles `score=0.0` correctly
 (does not suppress falsy float scores).
 
-#### `src/generation/llm_interface.py` — LLMInterface *(pending)*
-Single-responsibility LLM call wrapper. Parses the structured JSON response
-from GPT-4o into a `MedicalAnswer` object. Falls back to Ollama if the
-OpenAI API is unavailable.
+#### `src/generation/llm_interface.py` — LLMInterface
+Single-responsibility LLM call wrapper. Accepts a prompt from
+`PromptBuilder.build()` (flat string) or `PromptBuilder.build_messages()`
+(OpenAI-style list) interchangeably via `Union[str, List[dict]]`. Tries
+GPT-4o first via the OpenAI Chat Completions API with JSON mode enabled;
+falls back to Llama-3-8B via Ollama on any failure; returns a graceful
+fallback `MedicalAnswer` if both providers fail — never raises. Clients
+are initialised lazily on first use. Derives `MedicalAnswer.confidence`
+from `graph_subgraph.path_confidence` (product of Neo4j edge confidences)
+when available, otherwise uses the LLM-reported value. Handles all real-world
+LLM output patterns: clean JSON, markdown-fenced JSON, and JSON embedded in
+prose.
 
 #### `src/api/app.py` — FastAPI App *(pending)*
 Two endpoints: `POST /query` accepts a `QueryRequest` and returns a
@@ -308,7 +317,7 @@ medical-kg-assistant/
 │   │   └── orchestrator.py
 │   ├── generation/
 │   │   ├── prompt_builder.py
-│   │   └── llm_interface.py       (pending)
+│   │   └── llm_interface.py
 │   ├── api/                       (pending)
 │   ├── ui/                        (pending)
 │   └── tests/
@@ -316,7 +325,8 @@ medical-kg-assistant/
 │       ├── test_graph_builder.py
 │       ├── test_vector_indexer.py
 │       ├── test_orchestrator.py
-│       └── test_prompt_builder.py
+│       ├── test_prompt_builder.py
+│       └── test_llm_interface.py
 ├── docker-compose.yml
 ├── requirements.txt
 ├── pytest.ini
@@ -1443,11 +1453,133 @@ decisions. Information may be incomplete or outdated.
 | `_build_schema_block()` | Injects the JSON output schema the LLM must follow |
 | `_build_question_block(query)` | Wraps the user question in its section header |
 
+---
+
+### Module 7 — LLMInterface (`src/generation/llm_interface.py`)
+
+#### Position in the pipeline
+```
+PromptBuilder ──► LLMInterface ──► MedicalAnswer
+                       │
+               GPT-4o (primary)
+               Llama-3-8B via Ollama (fallback)
+```
+The final generation step. Receives the assembled prompt from PromptBuilder,
+calls the LLM, and returns a fully-parsed `MedicalAnswer`. Has no external
+dependencies beyond the `openai` package.
+
+#### Class: `LLMInterface`
+
+**Constructor**
+```python
+LLMInterface(
+    openai_api_key: Optional[str] = None,   # loaded from OPENAI_API_KEY env var
+    openai_model: Optional[str] = None,     # loaded from OPENAI_MODEL (default: gpt-4o)
+    ollama_base_url: Optional[str] = None,  # loaded from OLLAMA_BASE_URL
+    ollama_model: Optional[str] = None,     # loaded from OLLAMA_MODEL (default: llama3:8b)
+    max_tokens: int = 2000,
+    temperature: float = 0.1,               # low for reproducible medical answers
+)
+```
+
+**Key design decisions:**
+- `openai_api_key=None` reads from env; `openai_api_key=""` explicitly disables OpenAI (used in tests — distinguishes "not provided" from "intentionally empty")
+- Both clients (`_openai_client`, `_ollama_client`) are `None` at construction and initialised lazily on first use
+- Ollama is accessed via `openai.OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")` — no extra library needed
+
+---
+
+##### `call_llm(prompt, retrieval_result) → MedicalAnswer`
+
+Send a prompt to the LLM and return a structured answer. Never raises.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | `Union[str, List[dict]]` | required | Flat string from `build()` or messages list from `build_messages()` |
+| `retrieval_result` | `Optional[RetrievalResult]` | `None` | Used for confidence and retrieval mode propagation |
+
+**Returns:** `MedicalAnswer` — always a valid object, even on full provider failure
+
+**Provider cascade:**
+1. **OpenAI GPT-4o** (if `openai_api_key` is set) — called with `response_format={"type": "json_object"}` for guaranteed JSON output
+2. **Ollama** (fallback) — same OpenAI client pointed at `localhost:11434/v1`; JSON mode attempted first, retried without it if unsupported
+3. **Graceful fallback answer** — if both fail, returns a `MedicalAnswer` with `answer=_FALLBACK_ANSWER_TEXT` and `confidence=0.0`
+
+**Example:**
+```python
+llm = LLMInterface()
+messages = builder.build_messages(query, subgraph, chunks, snippets, merged)
+answer = llm.call_llm(messages, retrieval_result=result)
+# answer.answer     == "Metformin is the first-line treatment..."
+# answer.confidence == 0.72   (from graph_subgraph.path_confidence)
+# answer.citations  == [Citation(citation_id="c1", ...)]
+# answer.disclaimer == "⚠️ This information is for educational purposes only..."
+```
+
+---
+
+#### Output: `MedicalAnswer`
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `answer` | LLM JSON `answer` field | Synthesised medical answer text |
+| `citations` | LLM JSON `citations` array | Parsed `Citation` objects with id, title, url, source, year |
+| `graph_path` | LLM JSON `graph_path` array | Ordered node names/CUIs traversed |
+| `confidence` | `graph_subgraph.path_confidence` (preferred) or LLM JSON `confidence` | Clamped to [0.0, 1.0] |
+| `retrieval_mode` | `retrieval_result.retrieval_mode` | graph / vector / hybrid / web |
+| `disclaimer` | Model default | Medical safety disclaimer (always populated) |
+| `raw_graph_subgraph` | `retrieval_result.graph_subgraph` | Attached for downstream visualisation |
+
+---
+
+#### Confidence rule
+
+Per the project specification, confidence is the **product of Neo4j edge confidences** along the retrieved graph path (`graph_subgraph.path_confidence`). This overrides the LLM's self-reported confidence whenever a graph path exists. The LLM-reported value is used only as a fallback when no graph was traversed.
+
+```
+if graph_subgraph and path_confidence > 0:
+    confidence = path_confidence          # authoritative (product of edge confs)
+else:
+    confidence = llm_json["confidence"]   # fallback (LLM self-assessment)
+
+confidence = clamp(confidence, 0.0, 1.0)
+```
+
+---
+
+#### JSON extraction
+
+`_extract_json()` handles all real-world LLM output patterns without requiring JSON mode to be supported:
+
+| Pattern | Example |
+|---------|---------|
+| Clean JSON | `{"answer": "Metformin..."}` |
+| Fenced with language tag | ` ```json\n{...}\n``` ` |
+| Fenced without tag | ` ```\n{...}\n``` ` |
+| JSON in prose | `"Here is the result: {...} Hope this helps."` |
+
+Extraction uses brace-depth tracking to find the outermost JSON object, making it robust against LLMs that add explanatory text around their JSON response.
+
+---
+
+#### Internal helpers
+
+| Helper | Description |
+|--------|-------------|
+| `_to_messages(prompt)` | Normalises `str` or `List[dict]` to an OpenAI messages list |
+| `_call_openai(messages)` | Calls GPT-4o with JSON mode; raises on any API error |
+| `_call_ollama(messages)` | Calls Ollama; retries without JSON mode if unsupported |
+| `_extract_json(text)` | Strips fences and extracts outermost JSON object via brace tracking |
+| `_parse_response(raw, result)` | Parses JSON string into `MedicalAnswer`; fills missing fields with defaults |
+| `_build_confidence(llm_conf, result)` | Applies graph path confidence rule; clamps to [0.0, 1.0] |
+| `_ensure_openai_client()` | Lazy-init OpenAI client; returns `None` if key missing |
+| `_ensure_ollama_client()` | Lazy-init Ollama client via OpenAI SDK; returns `None` if unavailable |
+| `_fallback_answer(error_msg)` | Returns a safe placeholder `MedicalAnswer` when all providers fail |
+
 ## 6. Modules Pending
 
 | Module | File | Key Responsibility |
 |--------|------|--------------------|
-| 7 — LLMInterface | `src/generation/llm_interface.py` | GPT-4o call, MedicalAnswer parsing |
 | 8 — GraphVisualizer | `src/graph/visualizer.py` | pyvis HTML graph output |
 | 9 — FastAPI App | `src/api/app.py` | REST API endpoints |
 | 10 — Streamlit UI | `src/ui/streamlit_app.py` | Interactive web interface |
@@ -1643,6 +1775,7 @@ python -m pytest src/tests/test_graph_builder.py -v
 python -m pytest src/tests/test_vector_indexer.py -v
 python -m pytest src/tests/test_orchestrator.py -v
 python -m pytest src/tests/test_prompt_builder.py -v
+python -m pytest src/tests/test_llm_interface.py -v
 ```
 
 ### Test inventory
@@ -1654,6 +1787,7 @@ python -m pytest src/tests/test_prompt_builder.py -v
 | `test_vector_indexer.py` | 38 unit + 1 integration | VectorIndexer (chunking, embedding, collection management, upsert, similarity search, deletion, stats) |
 | `test_orchestrator.py` | 47 unit + 1 integration | RetrievalOrchestrator (classifier, graph/vector/web nodes, merger, routing, staleness, end-to-end run) |
 | `test_prompt_builder.py` | 52 unit | PromptBuilder (all 7 sections, build/build_messages, trimming, zero-score display, edge cases) |
+| `test_llm_interface.py` | 68 unit | LLMInterface (provider cascade, JSON extraction, confidence rule, citation parsing, fallback answer, lazy client init) |
 
 ---
 
