@@ -23,6 +23,7 @@ needed. Built on Neo4j, Qdrant, BioBERT, LangGraph, and GPT-4o.
    - [Module 5 — RetrievalOrchestrator](#module-5--retrievalorchestrator-srcretrievalorchestratorp)
    - [Module 6 — PromptBuilder](#module-6--promptbuilder-srcgenerationprompt_builderpy)
    - [Module 7 — LLMInterface](#module-7--llminterface-srcgenerationllm_interfacepy)
+   - [Module 8 — GraphVisualizer](#module-8--graphvisualizer-srcgraphvisualizerpy)
 6. [Modules Pending](#6-modules-pending)
 7. [Data Flow Walkthrough](#7-data-flow-walkthrough)
 8. [Graph Schema](#8-graph-schema)
@@ -190,7 +191,8 @@ src/
 ├── nlp/
 │   └── processor.py           ← Module 2: NLPProcessor
 ├── graph/
-│   └── builder.py             ← Module 3: GraphBuilder
+│   ├── builder.py             ← Module 3: GraphBuilder
+│   └── visualizer.py          ← Module 8: GraphVisualizer
 ├── vector/
 │   └── indexer.py             ← Module 4: VectorIndexer
 ├── retrieval/
@@ -242,6 +244,14 @@ Stateful Neo4j connection wrapper. Manages the driver lifecycle, exposes
 clean CRUD methods, and handles all Cypher. The `upsert_batch()` method is
 the primary ingestion entry point — it processes a list of triples in a
 single pass, writing nodes before edges to respect referential integrity.
+
+#### `src/graph/visualizer.py` — GraphVisualizer
+Converts a `GraphSubgraph` into a self-contained interactive HTML file using
+pyvis. Nodes in the answer path are highlighted with brighter colours and a
+gold border; both endpoints highlighted means the connecting edge is also
+thickened. Uses `cdn_resources='in_line'` to embed vis.js (~700 KB) so the
+output file works offline in any browser. Degrades gracefully when pyvis is
+not installed (text-only fallback) and handles empty subgraphs cleanly.
 
 #### `src/vector/indexer.py` — VectorIndexer
 Embeds text chunks with BioBERT and stores/retrieves them from Qdrant.
@@ -310,7 +320,8 @@ medical-kg-assistant/
 │   ├── nlp/
 │   │   └── processor.py
 │   ├── graph/
-│   │   └── builder.py
+│   │   ├── builder.py
+│   │   └── visualizer.py
 │   ├── vector/
 │   │   └── indexer.py
 │   ├── retrieval/
@@ -326,7 +337,8 @@ medical-kg-assistant/
 │       ├── test_vector_indexer.py
 │       ├── test_orchestrator.py
 │       ├── test_prompt_builder.py
-│       └── test_llm_interface.py
+│       ├── test_llm_interface.py
+│       └── test_graph_visualizer.py
 ├── docker-compose.yml
 ├── requirements.txt
 ├── pytest.ini
@@ -1576,11 +1588,137 @@ Extraction uses brace-depth tracking to find the outermost JSON object, making i
 | `_ensure_ollama_client()` | Lazy-init Ollama client via OpenAI SDK; returns `None` if unavailable |
 | `_fallback_answer(error_msg)` | Returns a safe placeholder `MedicalAnswer` when all providers fail |
 
+---
+
+### Module 8 — GraphVisualizer (`src/graph/visualizer.py`)
+
+#### Position in the pipeline
+```
+MedicalAnswer.raw_graph_subgraph ──► GraphVisualizer ──► graph_visualization.html
+```
+Receives the `GraphSubgraph` attached to a `MedicalAnswer` and produces a
+self-contained interactive HTML file. Has no external dependencies beyond
+`pyvis` and the standard library.
+
+#### Class: `GraphVisualizer`
+
+**Constructor**
+```python
+GraphVisualizer(
+    output_path: str = "graph_visualization.html",  # default save location
+    height: str = "700px",    # vis.js canvas height
+    width: str = "100%",      # vis.js canvas width
+    bgcolor: str = "#f8f9fa", # canvas background colour
+)
+```
+
+---
+
+##### `build_pyvis_graph(subgraph, highlight_node_ids) → str`
+
+Build a self-contained pyvis HTML string from a `GraphSubgraph`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `subgraph` | `GraphSubgraph` | required | The subgraph to visualise — may be empty |
+| `highlight_node_ids` | `Optional[List[str]]` | `None` | Node IDs in the answer path — rendered with brighter colours and gold border |
+
+**Returns:** `str` — complete HTML string with vis.js embedded inline (~700 KB). Write directly to `graph_visualization.html` and open in any browser offline.
+
+**Visual encoding:**
+
+| Element | Normal style | Answer-path style |
+|---------|-------------|-------------------|
+| Node background | Base colour (see table) | Brighter variant of same colour |
+| Node border | Dark shade of base colour | Gold `#f1c40f` |
+| Node border width | 2 px | 5 px |
+| Node size | 22 | 32 |
+| Edge | 2 px, `#636e72` | 5 px, `#2d3436` (when both endpoints highlighted) |
+
+**Example:**
+```python
+viz = GraphVisualizer()
+html = viz.build_pyvis_graph(
+    subgraph=answer.raw_graph_subgraph,
+    highlight_node_ids=answer.graph_path,
+)
+viz.save(html)  # writes graph_visualization.html
+```
+
+---
+
+##### `save(html, path) → str`
+
+Write *html* to *path* and return the absolute path.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `html` | `str` | required | HTML string from `build_pyvis_graph` |
+| `path` | `Optional[str]` | `None` | Output path; defaults to `self.output_path` |
+
+**Returns:** `str` — absolute path of the written file. Creates parent directories automatically.
+
+---
+
+##### `build_and_save(subgraph, highlight_node_ids, path) → str`
+
+Convenience wrapper: `build_pyvis_graph()` + `save()` in one call.
+
+**Returns:** `str` — absolute path of the saved HTML file.
+
+---
+
+#### Colour map
+
+| Node type | Normal background | Highlighted background | Border when highlighted |
+|-----------|-------------------|----------------------|------------------------|
+| Disease | `#e74c3c` (red) | `#ff7675` | `#f1c40f` (gold) |
+| Drug | `#3498db` (blue) | `#74b9ff` | `#f1c40f` (gold) |
+| Gene | `#2ecc71` (green) | `#55efc4` | `#f1c40f` (gold) |
+| Symptom | `#e67e22` (orange) | `#fdcb6e` | `#f1c40f` (gold) |
+| ClinicalTrial | `#9b59b6` (purple) | `#a29bfe` | `#f1c40f` (gold) |
+| Paper | `#95a5a6` (gray) | `#dfe6e9` | `#f1c40f` (gold) |
+
+---
+
+#### Tooltips
+
+Each node displays an HTML tooltip on hover containing: name, type, UMLS CUI,
+confidence score, last-updated date, and a clickable source URL link. Each
+edge tooltip shows: source → target names, relation type, confidence, year,
+and source document ID.
+
+---
+
+#### Legend
+
+A fixed-position legend panel is injected before `</body>` showing the
+colour key for all six node types and the gold-dot answer-path marker.
+
+---
+
+#### Module-level helper functions (public, tested independently)
+
+| Function | Description |
+|----------|-------------|
+| `get_node_color(node_type_value, is_highlighted)` | Returns pyvis colour dict with `background`, `border`, `highlight`, `hover` keys |
+| `build_node_tooltip(node, is_highlighted)` | Returns HTML tooltip string for a node |
+| `build_edge_tooltip(edge, src_name, tgt_name)` | Returns HTML tooltip string for an edge |
+
+#### Internal helpers
+
+| Helper | Description |
+|--------|-------------|
+| `_create_network()` | Instantiates `pyvis.Network` with `cdn_resources='in_line'` |
+| `_apply_options(net)` | Sets Barnes-Hut physics + hover/keyboard interaction via `set_options()` |
+| `_inject_legend(html)` | Inserts colour-legend div before `</body>` |
+| `_empty_html()` | Returns a clean "No graph data" page for empty subgraphs |
+| `_fallback_html(subgraph, highlighted)` | Text-only HTML when pyvis is not installed |
+
 ## 6. Modules Pending
 
 | Module | File | Key Responsibility |
 |--------|------|--------------------|
-| 8 — GraphVisualizer | `src/graph/visualizer.py` | pyvis HTML graph output |
 | 9 — FastAPI App | `src/api/app.py` | REST API endpoints |
 | 10 — Streamlit UI | `src/ui/streamlit_app.py` | Interactive web interface |
 
@@ -1776,6 +1914,7 @@ python -m pytest src/tests/test_vector_indexer.py -v
 python -m pytest src/tests/test_orchestrator.py -v
 python -m pytest src/tests/test_prompt_builder.py -v
 python -m pytest src/tests/test_llm_interface.py -v
+python -m pytest src/tests/test_graph_visualizer.py -v
 ```
 
 ### Test inventory
@@ -1788,6 +1927,7 @@ python -m pytest src/tests/test_llm_interface.py -v
 | `test_orchestrator.py` | 47 unit + 1 integration | RetrievalOrchestrator (classifier, graph/vector/web nodes, merger, routing, staleness, end-to-end run) |
 | `test_prompt_builder.py` | 52 unit | PromptBuilder (all 7 sections, build/build_messages, trimming, zero-score display, edge cases) |
 | `test_llm_interface.py` | 68 unit | LLMInterface (provider cascade, JSON extraction, confidence rule, citation parsing, fallback answer, lazy client init) |
+| `test_graph_visualizer.py` | 73 unit | GraphVisualizer (colour map, tooltips, legend, highlight rendering, save/build_and_save, fallback, all 6 node types) |
 
 ---
 
